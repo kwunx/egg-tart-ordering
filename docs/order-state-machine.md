@@ -10,7 +10,8 @@
 | `pending_payment` | `failed` | Mock 确认失败，保留库存，可在截止前重试 |
 | `paid` | `success` | 已支付，等待制作，不再次扣库存 |
 | `making` | `success` | 制作中 |
-| `completed` | `success` | 已完成 |
+| `ready` | `success` | 制作完成，待取餐 |
+| `completed` | `success` | 顾客已取餐 |
 | `cancelled` | `closed` | 手动或超时关闭，原扣减库存已经恢复 |
 
 V1.0 不允许其他组合。`refunded` 仅作为未来真实支付扩展的预留值，V1.0 不产生退款状态或退款流程。
@@ -28,7 +29,9 @@ pending_payment + pending/failed
 paid + success
       ↓ 管理员开始制作
 making + success
-      ↓ 管理员完成订单
+      ↓ 管理员制作完成
+ready + success
+      ↓ 管理员确认取餐
 completed + success
 ```
 
@@ -43,15 +46,16 @@ completed + success
 | 创建订单同用户同请求键、不同内容 | 幂等内容冲突 | 409 / `40902` |
 | 待支付且未到期，Mock 成功 | payment→success，order→paid，不更新库存 | 200 / 0 |
 | 待支付且未到期，Mock 确认失败 | payment→failed，保留待支付订单和库存；提交后返回失败 | 409 / `40905` |
-| paid/making/completed，再次支付 | 返回当前订单和首次支付结果，不修改支付流水及时间 | 200 / 0 |
+| paid/making/ready/completed，再次支付 | 返回当前订单和首次支付结果，不修改支付流水及时间 | 200 / 0 |
 | 待支付但已到期，尝试支付 | 先关闭并恢复库存，提交后返回过期 | 409 / `40904` |
 | 已因 timeout 关闭，再次支付 | 保留关闭状态，不恢复第二次库存 | 409 / `40904` |
 | 已因 manual 关闭，再次支付 | 不允许支付 | 409 / `40903` |
 | 待支付，手动取消 | 关闭并恢复库存；已到期优先认定 timeout | 200 / 0 |
 | 已取消，再次取消 | 返回原关闭结果，保留首次原因，不更新库存 | 200 / 0 |
-| paid/making/completed，尝试取消 | 拒绝取消 | 409 / `40903` |
+| paid/making/ready/completed，尝试取消 | 拒绝取消 | 409 / `40903` |
 | paid，管理员开始制作 | order→making，payment 保持 success | 200 / 0 |
-| making，管理员完成订单 | order→completed，payment 保持 success | 200 / 0 |
+| making，管理员制作完成 | order→ready，payment 保持 success | 200 / 0 |
+| ready，管理员确认取餐 | order→completed，payment 保持 success | 200 / 0 |
 
 未列出的状态转换默认拒绝，返回 HTTP 409、业务码 `40903`；认证、归属和参数错误按对应 API 规则处理。管理员制作/完成不提供任意目标状态写入接口。
 
@@ -97,7 +101,7 @@ COMMIT
 
 库存恢复、`cancelled`、`closed` 和取消原因必须同事务提交。库存只在首次有效关闭时恢复，后续重放或竞争失败者不得再次恢复。历史商品停用不阻止恢复；恢复使用订单明细实际扣减快照，不读取现行套餐配置。
 
-管理员 `paid→making`、`making→completed` 可用条件更新并检查影响行数：
+管理员 `paid→making`、`making→ready`、`ready→completed` 可用条件更新并检查影响行数：
 
 ```sql
 UPDATE orders
@@ -142,3 +146,12 @@ WHERE id = :id
 - Mock 失败可以在截止前重试成功，也可以手动或超时关闭。
 - 等待行锁期间跨越到期时刻，必须按锁后当前时间关闭；返回过期错误后数据库中的关闭和库存恢复已提交。
 - worker 重复扫描及中断重启不重复释放；事务异常不产生部分支付、部分关闭或部分库存恢复。
+
+
+---
+
+## 8. 取餐号与暂停接单
+
+- 首次成功支付分配取餐编号和付款成功同事务，失败/取消不分配；paid/making/ready/completed 支付状态保持 success。
+- 制作完成只能 making→ready，确认顾客取餐才能 ready→completed。
+- 首次下单在幂等占位后锁定接单单例配置，暂停时回滚并返回 40906；旧单流转不受暂停影响，详见 [V1.0 自取与暂停接单规则](v1-operation-rules.md)。

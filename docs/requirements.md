@@ -212,6 +212,7 @@ cancelled
 pending_payment
 paid
 making
+ready
 completed
 cancelled
 ```
@@ -224,6 +225,8 @@ pending_payment
      paid
       ↓
     making
+      ↓
+    ready
       ↓
   completed
 ```
@@ -285,7 +288,7 @@ payment.success
 | 订单状态 | 支付状态 | 含义 |
 |---|---|---|
 | pending_payment | pending / failed | 等待首次支付或失败后重试，仍占用库存 |
-| paid / making / completed | success | 已支付，不再次扣库存 |
+| paid / making / ready / completed | success | 已支付，不再次扣库存 |
 | cancelled | closed | 已关闭，库存已恢复 |
 
 Mock 默认成功，确认失败由服务端测试配置模拟，客户端不得提交支付结果或失败开关。确认失败将同一条支付记录改为 `failed`，订单保持待支付、截止时间不变、库存不恢复；到期前可重试或手动取消。`payments.order_id` 保持唯一，失败重试不新建支付记录。
@@ -330,7 +333,8 @@ V1.0 不接真实微信支付，但架构保留 `payment_method=wechat` 的扩�
 - 增加或减少可售库存
 - 配置套餐
 - 查看订单
-- 更新订单状态
+- 更新订单状态（含 ready 待取餐、completed 已取餐）
+- 暂停/恢复接单
 - 查看基础数据概览
 
 商品删除采用软删除/停用，不直接物理删除历史业务数据。
@@ -397,3 +401,13 @@ V1.0 不接真实微信支付，但架构保留 `payment_method=wechat` 的扩�
 开发环境与生产环境分离，生产环境使用 HTTPS。
 
 后端、管理 SPA 和微信小程序分别构建、分别部署或发布。生产环境可使用同域 Nginx 为 `/admin/*` 提供管理前端并将 `/api/v1/*` 转发给后端；前后端分离不要求跨域部署。微信小程序需单独完成目标平台的构建和运行验收，不能以“uni-app 可编译”代替登录与业务流程的实测。
+
+
+---
+
+## 11. V1.0 摊位自取与接单要求
+
+- 单摊位自取；首次 Mock 支付成功后按 Asia/Shanghai 经营日从 A001 起分配取餐号，失败、待支付和取消不占号。
+- 管理订单按 `paid → making → ready → completed`，分别表示待制作、制作中、待取餐、已取餐，不能跳级。
+- 暂停接单只拒绝新订单；商品浏览、旧单重放、旧单支付/取消、超时回收及制作取餐正常继续。
+- 首次下单占幂等键后锁定单例营业配置 `FOR SHARE`，关闭时回滚并返回 40906，详见 [V1.0 自取与暂停接单规则](v1-operation-rules.md)。

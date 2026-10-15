@@ -2,7 +2,7 @@
 
 ## 1. 数据库
 
-PostgreSQL，业务事务使用 READ COMMITTED。V1.0 共 8 张核心业务表及 1 张 `stock_adjustments` 库存调整记录表；不引入独立余额表、库存预占表、通用幂等表或支付尝试表。
+PostgreSQL，业务事务使用 READ COMMITTED。V1.0 共 8 张核心业务表、1 张 `stock_adjustments` 调整表及 2 张运营辅助表（`pickup_daily_counters`、`store_settings`），共 11 张；不引入独立余额表、库存预占表、通用幂等表或支付尝试表。
 
 金额字段统一：
 
@@ -122,6 +122,8 @@ UNIQUE(combo_id, product_id)
 | remark | VARCHAR(500) NOT NULL DEFAULT '' | 缺省/NULL 标准化为空字符串 |
 | expires_at | TIMESTAMPTZ NOT NULL | 固化支付截止时间 |
 | cancel_reason | VARCHAR(20) NULL | 仅取消时为 manual 或 timeout |
+| pickup_date | DATE NULL | 支付成功对应 Asia/Shanghai 经营日 |
+| pickup_sequence | INTEGER NULL | 当日正整数取餐序号 |
 | created_at | TIMESTAMPTZ | 创建时间 |
 | updated_at | TIMESTAMPTZ | 更新时间 |
 
@@ -130,6 +132,7 @@ UNIQUE(combo_id, product_id)
 - pending_payment
 - paid
 - making
+- ready
 - completed
 - cancelled
 
@@ -217,7 +220,7 @@ UNIQUE(combo_id, product_id)
 | 订单状态 | 支付状态 |
 |---|---|
 | pending_payment | pending、failed |
-| paid、making、completed | success |
+| paid、making、ready、completed | success |
 | cancelled | closed |
 
 未到期的 failed 可在原 payment 行上重试；失败不释放库存、不改变订单期限。取消/超时把 pending 或 failed 置为 closed。success 必须有 transaction_id 和 paid_at，后续重复支付请求只返回原结果；pending、failed、closed 的这两个字段为 NULL。refunded 仅未来预留，V1.0 不生成该状态。
@@ -374,3 +377,13 @@ JSON 子字段必须由服务端验证：子商品 ID 唯一、为正整数，�
 商品采用停用而非物理删除，保留历史订单、扣减快照和库存调整引用。涉及商品、订单、支付与调整记录的外键不允许级联删除历史业务数据；即使 order_items.product_id 允许 NULL，库存释放也必须使用仍可解析的实际扣减商品快照。V1.0 不提供物理删除这些业务对象的入口。
 
 完整接口及规范化约定见 [API 设计](api-design.md)，并发/超时规则见 [库存设计](inventory-design.md)，验收见 [测试计划](testing-plan.md)。
+
+
+---
+
+## 附录：V1.0 取餐编号与接单配置
+
+- `orders` 增加 `UNIQUE(pickup_date,pickup_sequence)`；pending_payment/cancelled 两字段同为 NULL，paid/making/ready/completed 都必须非 NULL 且序号 > 0；`pickup_no` 由服务端展示为 A001，不单独保存。
+- `pickup_daily_counters(pickup_date DATE PRIMARY KEY, last_sequence INTEGER NOT NULL CHECK(last_sequence>0))`；首次支付成功在订单/payment 事务内用 `INSERT ... ON CONFLICT DO UPDATE ... RETURNING` 原子取号，事务回滚不占号。
+- `store_settings(id SMALLINT PRIMARY KEY CHECK(id=1), ordering_enabled BOOLEAN NOT NULL DEFAULT TRUE, notice VARCHAR(200) NOT NULL DEFAULT '', updated_by_admin_id BIGINT NULL REFERENCES admin_users(id), updated_at TIMESTAMPTZ NOT NULL)`；迁移须插入 id=1。
+- 新单建立幂等键后 `SELECT ... FROM store_settings WHERE id=1 FOR SHARE`，管理员 UPDATE 该行互斥；暂停关闭返回 40906 并回滚。详见 [V1.0 自取与暂停接单规则](v1-operation-rules.md)。

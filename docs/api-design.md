@@ -61,6 +61,7 @@ HTTP 409 的业务 `code` 固定为以下整数：
 | 40903 | 当前订单/支付状态不允许操作 |
 | 40904 | 支付请求对应的订单已过期并关闭 |
 | 40905 | 服务端 Mock 确认失败，本次失败状态已提交 |
+| 40906 | 当前暂停接单，不能创建新订单 |
 
 错误响应沿用 `code/message/data`，`data=null`。需要保存的超时关闭或 Mock 失败状态必须先提交，再返回 HTTP 409；不能通过抛出异常把这些变化回滚。
 
@@ -218,6 +219,8 @@ BEGIN
 ↓
 插入 orders 行，占用 (user_id, client_request_id) 唯一键
 ↓
+锁定 store_settings(id=1) FOR SHARE，关闭则回滚返回 40906
+↓
 校验当前商品/套餐，读取服务端价格
 ↓
 生成订单项及实际扣减快照，汇总每个普通商品的总消耗
@@ -244,6 +247,8 @@ COMMIT → HTTP 201
   "data": {
     "order_id": 101,
     "order_no": "ET202610100001",
+    "pickup_date": null,
+    "pickup_no": null,
     "client_request_id": "550e8400-e29b-41d4-a716-446655440000",
     "status": "pending_payment",
     "total_amount": "54.00",
@@ -309,13 +314,13 @@ COMMIT → HTTP 201
 
 | 锁定后状态 | 行为 |
 |---|---|
-| `paid/making/completed + success` | HTTP 200，返回原支付结果，不改 `paid_at/transaction_id`；不因当前已超过原期限而关闭已支付订单 |
+| `paid/making/ready/completed + success` | HTTP 200，返回原支付结果，不改 `paid_at/transaction_id`；不因当前已超过原期限而关闭已支付订单 |
 | `cancelled + closed` | `cancel_reason=timeout` 返回 HTTP 409 / 40904，`manual` 返回 HTTP 409 / 40903；不支付、不再恢复库存 |
 | `pending_payment + pending/failed` 且当前时间小于 `expires_at` | 允许服务端进行 Mock 确认 |
 | `pending_payment + pending/failed` 且当前时间大于等于 `expires_at` | 同一事务恢复库存，写 `cancelled + closed`、`cancel_reason=timeout`；提交后 HTTP 409 / 40904 |
 | 其他组合 | HTTP 409 / 40903，并记录状态异常 |
 
-确认成功：同一事务写 payment `success`、生成 Mock `transaction_id` 和 `paid_at`，订单置为 `paid`。确认失败：仅将 payment 置为 `failed`，订单仍 `pending_payment`，保留库存且不延长到期时间；先提交，再返回 HTTP 409 / 40905。未到期时可在原订单、原 payment 行上重试，不创建第二条支付记录。
+确认成功：同一事务分配当日取餐号、写 payment `success`、生成 Mock `transaction_id` 和 `paid_at`，订单置为 `paid`。确认失败：仅将 payment 置为 `failed`，订单仍 `pending_payment`，保留库存且不延长到期时间；先提交，再返回 HTTP 409 / 40905。未到期时可在原订单、原 payment 行上重试，不创建第二条支付记录。
 
 成功及成功重放示例（HTTP 200）：
 
@@ -326,6 +331,8 @@ COMMIT → HTTP 201
   "data": {
     "order_id": 101,
     "status": "paid",
+    "pickup_date": "2026-10-10",
+    "pickup_no": "A001",
     "payment": {
       "payment_method": "mock",
       "payment_status": "success",
@@ -505,7 +512,7 @@ Authorization: Bearer <admin-token>
 
 ### POST `/api/v1/admin/orders/{id}/complete`
 
-`making → completed`，支付状态须为 `success`。
+`ready → completed`，顾客已取餐；支付状态须为 `success`，不得跳过 ready。
 
 ### GET `/api/v1/admin/dashboard`
 
@@ -518,7 +525,7 @@ Authorization: Bearer <admin-token>
 | 订单状态 | V1.0 允许的支付状态 |
 |---|---|
 | pending_payment | pending、failed |
-| paid、making、completed | success |
+| paid、making、ready、completed | success |
 | cancelled | closed |
 
 `refunded` 仅为未来预留，本版本不产生。合法订单转换仍为：
@@ -527,7 +534,8 @@ Authorization: Bearer <admin-token>
 pending_payment → paid
 pending_payment → cancelled
 paid → making
-making → completed
+making → ready
+ready → completed
 ```
 
 支付失败不增加订单状态，取消或超时统一关闭支付。其他组合或转换默认拒绝，客户端不能直接提交任意 status。详见 [订单状态机](order-state-machine.md)。
@@ -553,3 +561,14 @@ making → completed
 - 管理调整与审计记录同事务，同标识重放不再增减，与下单并发不会覆盖对方修改。
 
 字段及约束见 [数据库设计](database-design.md)，回归场景见 [测试计划](testing-plan.md)。
+
+
+---
+
+## 11. V1.0 运营 API
+
+- `GET /api/v1/store/status`：公开查询 `{ordering_enabled,notice}`。
+- `GET /api/v1/admin/store/ordering`：管理员读取接单状态。
+- `PUT /api/v1/admin/store/ordering`：管理员设置 `{"ordering_enabled":false}` 或 true，重复设置幂等。
+- `POST /api/v1/admin/orders/{id}/ready`：仅 making→ready；原 `POST /api/v1/admin/orders/{id}/complete` 修改为 ready→completed。
+- 顾客/管理员订单列表和详情，以及成功支付响应包含 `pickup_date`（YYYY-MM-DD 或 null）、`pickup_no`（A001 或 null）。取餐号不能代替认证，支付成功同事务分配，重放不变。详见 [V1.0 自取与暂停接单规则](v1-operation-rules.md)。
